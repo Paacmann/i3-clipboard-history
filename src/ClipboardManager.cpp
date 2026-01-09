@@ -4,6 +4,9 @@
 #include <cstdio>
 #include <algorithm>
 #include <mutex>
+#include <ostream>
+#include <sstream>
+#include <string>
 
 
 ClipboardHistory::ClipboardHistory(size_t maxSize)
@@ -68,3 +71,47 @@ void ClipboardHistory::updateClipboard() {
 	_lastValue = current;
 	addItem(current);
 }
+
+void ClipboardHistory::showMenu() {
+	// zakljucavam , stitim _history
+	std::lock_guard<std::mutex> lock(_mutex);
+	
+	if (_history.empty()) {
+		std::cerr << "ClipboardHistory is empty \n";
+		return;
+	}
+
+	// pripremam string sa stavkama za menu
+	std::ostringstream menuStream;
+	for (const auto& element : _history)
+		menuStream << element << "\n";
+
+	std::string menu = menuStream.str(); // ovo proveri 
+	
+	// pokrecemo dmenu , saljemo menu na stdin
+	FILE* pipe = popen("dmenu -i -l 10", "w+");
+	if (!pipe) {
+		std::cerr << "Failed to open demnu \n";
+		return;
+	}
+	
+	fwrite(menu.c_str(),1,menu.size(),pipe);
+	fflush(pipe); // flush da dmenu vidi sadrzaj
+	
+	// citamo odabranu stavku
+	char buffer[4096];
+	std::string selected;
+	if (fgets(buffer,sizeof(buffer),pipe)) {
+		selected = buffer;
+		if (!selected.empty() && selected.back() == '\n')
+			selected.pop_back();
+	}
+
+	pclose(pipe);
+
+	if (selected.empty()) return;
+
+	writeClipboard(selected);
+
+	std::cout << "Copied to Clipboard: " << selected << "\n";
+} 
