@@ -1,5 +1,7 @@
 #include "../include/ClipboardManager.hpp"
 #include <cstddef>
+#include <fstream>
+#include <ios>
 #include <iostream>
 #include <cstdio>
 #include <algorithm>
@@ -50,14 +52,19 @@ void ClipboardHistory::writeClipboard(const std::string& text) const {
 void ClipboardHistory::addItem(const std::string& text) {
 	
 	std::lock_guard<std::mutex> lock(_mutex);
-	auto it = std::find(_history.begin(),_history.end(),text);
-	if (it != _history.end())
-		_history.erase(it);
-	
-	_history.push_front(text);
-	if (_history.size() > _maxSize)
-		_history.pop_back();
+	//auto it = std::find(_history.begin(),_history.end(),text);
+	//if (it != _history.end())
+	//	_history.erase(it);
+	auto history = loadHistory();
+	if (!history.empty() && history.front() == text)
+		return;
 
+	
+	history.push_front(text);
+	if (history.size() > _maxSize)
+		history.pop_back();
+	
+	saveHistory(history);
 }
 
 
@@ -74,29 +81,33 @@ void ClipboardHistory::updateClipboard() {
 
 void ClipboardHistory::showMenu() {
 	// zakljucavam , stitim _history
-	std::lock_guard<std::mutex> lock(_mutex);
-	
-	if (_history.empty()) {
+	//std::lock_guard<std::mutex> lock(_mutex);
+
+	auto history = loadHistory();	
+	if (history.empty()) {
 		std::cerr << "ClipboardHistory is empty \n";
 		return;
 	}
 
 	// pripremam string sa stavkama za menu
 	std::ostringstream menuStream;
-	for (const auto& element : _history)
+	for (const auto& element : history)
 		menuStream << element << "\n";
 
 	std::string menu = menuStream.str(); // ovo proveri 
 	
+	
+	std::string cmd = "echo \"" + menu + "\" | dmenu -i -l 10";
+
 	// pokrecemo dmenu , saljemo menu na stdin
-	FILE* pipe = popen("dmenu -i -l 10", "w+");
+	FILE* pipe = popen(cmd.c_str(), "r");
 	if (!pipe) {
-		std::cerr << "Failed to open demnu \n";
+		std::cerr << "Failed to open dmenu\n";
 		return;
 	}
 	
-	fwrite(menu.c_str(),1,menu.size(),pipe);
-	fflush(pipe); // flush da dmenu vidi sadrzaj
+	//fwrite(menu.c_str(),1,menu.size(),pipe);
+	//fflush(pipe); // flush da dmenu vidi sadrzaj
 	
 	// citamo odabranu stavku
 	char buffer[4096];
@@ -114,4 +125,31 @@ void ClipboardHistory::showMenu() {
 	writeClipboard(selected);
 
 	std::cout << "Copied to Clipboard: " << selected << "\n";
-} 
+}
+
+static const char* SHARED_FILE = "/tmp/clipboardhistory.txt";
+
+void ClipboardHistory::saveHistory(const std::deque<std::string>& history) const {
+	std::ofstream out(SHARED_FILE, std::ios::trunc);
+	if (!out.is_open())
+		return ;
+	for (const auto &elem : history)
+		out << elem << '\n';
+
+}
+
+std::deque<std::string> ClipboardHistory::loadHistory() const {
+	std::deque<std::string> history;
+	std::ifstream in(SHARED_FILE);
+
+	if (!in.is_open())
+		return history;
+
+	std::string line;
+	while (std::getline(in,line)) {
+		if (!line.empty())
+			history.push_back(line);
+	}
+	
+	return history;
+}
