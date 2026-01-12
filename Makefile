@@ -8,7 +8,7 @@ TARGET = clipboardhistory
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
-	$(CXX) $(CXXFLAGS) $(OBJ) -o $(TARGET)
+	$(CXX) $(CXXFLAGS) $(OBJ) -o $(TARGET) -pthread -lrt
 
 build/%.o: src/%.cpp
 	mkdir -p build
