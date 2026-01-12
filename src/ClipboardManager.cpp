@@ -1,155 +1,199 @@
 #include "../include/ClipboardManager.hpp"
 #include <cstddef>
-#include <fstream>
-#include <ios>
-#include <iostream>
 #include <cstdio>
-#include <algorithm>
-#include <mutex>
+#include <cstdlib>
 #include <ostream>
-#include <sstream>
+#include <pthread.h>
 #include <string>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <cstring>
+#include <sstream>
+#include <iostream>
 
 
 ClipboardHistory::ClipboardHistory(size_t maxSize)
-	: _maxSize(maxSize)
-	{}
+	: _maxSize(maxSize) , _shmFd(-1) , _shm(nullptr)
+	{
+		bool create = false;
+		_shmFd = shm_open(SHARED_NAME, O_RDWR, 0666);
 
-
-std::string ClipboardHistory::readClipboard() const {
-
-	FILE* pipe = popen("xclip -o -selection clipboard 2>/dev/null","r");
-	if (!pipe)
-		return "";
-	
-	char buffer[4096];
-	std::string result;
-
-	while (fgets(buffer , sizeof(buffer) , pipe)) {
-		result += buffer;
+		if (_shmFd == -1) {
+    			create = true;
+		}
+		
+		initSharedMemory(create);
 	}
-	
-	pclose(pipe);
 
-	return result;
+
+
+
+ClipboardHistory::~ClipboardHistory() {
+	if (_shm) {
+		munmap(_shm, sizeof(SharedClipboard));
+	}
+
+	if (_shmFd != -1)
+		close(_shmFd);
 
 }
 
+
+void ClipboardHistory::initSharedMemory(bool create) {
+	int flags = create ? (O_CREAT | O_RDWR) : O_RDWR;
+
+	_shmFd = shm_open(SHARED_NAME,flags,0666);
+	if (_shmFd == -1) {
+		perror("shm open error!");
+		std::exit(1);
+	}
+
+	if (create) {
+		ftruncate(_shmFd , sizeof(SharedClipboard));
+	}
+
+
+	_shm = static_cast<SharedClipboard*>(
+			mmap(nullptr,sizeof(SharedClipboard),PROT_READ | PROT_WRITE,MAP_SHARED,_shmFd,0));
+
+	
+	if (_shm == MAP_FAILED) {
+		perror("mmap failed!");
+		std::exit(1);
+	}
+
+	if (create) {
+		pthread_mutexattr_t attr;
+		pthread_mutexattr_init(&attr);
+		pthread_mutexattr_setpshared(&attr,PTHREAD_PROCESS_SHARED);
+
+		pthread_mutex_init(&_shm->mutex, &attr);
+		pthread_mutexattr_destroy(&attr);
+		_shm->count = 0;
+	
+	}
+}
+
+
+
+
+std::string ClipboardHistory::readClipboard() const {
+	FILE* pipe = popen("xclip -o -selection clipboard 2>/dev/null", "r");
+	if (!pipe) {
+		return "";
+	}
+
+	char buffer[MAX_LENGTH];
+	std::string res;
+	while (fgets(buffer,sizeof(buffer),pipe)) {
+		res += buffer;
+	}
+	
+	pclose(pipe);
+	return res;
+}
 
 void ClipboardHistory::writeClipboard(const std::string& text) const {
 	FILE* pipe = popen("xclip -i -selection clipboard", "w");
 	if (!pipe)
 		return;
-	
-	size_t written = fwrite(text.c_str(),1,text.size(), pipe);
-	if (written != text.size())
-		std::cerr << "Warning: fwrite failed!";
-	
+
+	fwrite(text.c_str(),1,text.size(),pipe);
 	pclose(pipe);
 }
 
 
 void ClipboardHistory::addItem(const std::string& text) {
-	
-	std::lock_guard<std::mutex> lock(_mutex);
-	//auto it = std::find(_history.begin(),_history.end(),text);
-	//if (it != _history.end())
-	//	_history.erase(it);
-	auto history = loadHistory();
-	if (!history.empty() && history.front() == text)
-		return;
+	pthread_mutex_lock(&_shm->mutex);
 
+	if (_shm->count > 0 && std::strcmp(_shm->items[0],text.c_str()) == 0) {
+		pthread_mutex_unlock(&_shm->mutex);
+		return;
+	}
+
+
+	if (_maxSize == 0) {
+    		pthread_mutex_unlock(&_shm->mutex);
+    		return;
+	}
+
+
+	if (_shm->count == _maxSize) {
+		for (size_t i = _shm->count - 1; i > 0; i--) {
+			std::strcpy(_shm->items[i],_shm->items[i-1]);
+		}
+
+	} else {
+		for (size_t i = _shm->count; i > 0; i--) {
+			std::strcpy(_shm->items[i],_shm->items[i-1]);
+		}
+
+		_shm->count++;
+	}	
 	
-	history.push_front(text);
-	if (history.size() > _maxSize)
-		history.pop_back();
-	
-	saveHistory(history);
+	std::strncpy(_shm->items[0], text.c_str(), MAX_LENGTH - 1);
+	_shm->items[0][MAX_LENGTH - 1] = '\0';
+
+	pthread_mutex_unlock(&_shm->mutex);
 }
 
-
 void ClipboardHistory::updateClipboard() {
-	
 	std::string current = readClipboard();
-
 	if (current.empty() || current == _lastValue)
-		return ;
-	
+		return;
+
 	_lastValue = current;
 	addItem(current);
 }
 
 void ClipboardHistory::showMenu() {
-	// zakljucavam , stitim _history
-	//std::lock_guard<std::mutex> lock(_mutex);
+	pthread_mutex_lock(&_shm->mutex);
 
-	auto history = loadHistory();	
-	if (history.empty()) {
-		std::cerr << "ClipboardHistory is empty \n";
+	if (_shm->count == 0) {
+		pthread_mutex_unlock(&_shm->mutex);
+		std::cerr << "Clipboard is empty";
 		return;
 	}
 
-	// pripremam string sa stavkama za menu
-	std::ostringstream menuStream;
-	for (const auto& element : history)
-		menuStream << element << "\n";
+	std::ostringstream menu;
+	for (size_t i = 0; i < _shm->count; i++)
+		menu << _shm->items[i] << "\n";
 
-	std::string menu = menuStream.str(); // ovo proveri 
-	
-	
-	std::string cmd = "echo \"" + menu + "\" | dmenu -i -l 10";
+	pthread_mutex_unlock(&_shm->mutex);
 
-	// pokrecemo dmenu , saljemo menu na stdin
+
+	
+	std::string cmd = "echo \"" + menu.str() + "\" | dmenu -i -l 10";
+	
 	FILE* pipe = popen(cmd.c_str(), "r");
-	if (!pipe) {
-		std::cerr << "Failed to open dmenu\n";
+    	
+	if (!pipe)
 		return;
-	}
+
+    	char buffer[MAX_LENGTH];
+    	std::string selected;
+
+    	if (fgets(buffer, sizeof(buffer), pipe)) {
+        	selected = buffer;
+        	if (!selected.empty() && selected.back() == '\n')
+            		selected.pop_back();
+    	}
+
+    	pclose(pipe);
+
+    	if (!selected.empty()) {
+        	writeClipboard(selected);
+    	}
 	
-	//fwrite(menu.c_str(),1,menu.size(),pipe);
-	//fflush(pipe); // flush da dmenu vidi sadrzaj
-	
-	// citamo odabranu stavku
-	char buffer[4096];
-	std::string selected;
-	if (fgets(buffer,sizeof(buffer),pipe)) {
-		selected = buffer;
-		if (!selected.empty() && selected.back() == '\n')
-			selected.pop_back();
-	}
+} 
 
-	pclose(pipe);
 
-	if (selected.empty()) return;
 
-	writeClipboard(selected);
 
-	std::cout << "Copied to Clipboard: " << selected << "\n";
-}
 
-static const char* SHARED_FILE = "/tmp/clipboardhistory.txt";
 
-void ClipboardHistory::saveHistory(const std::deque<std::string>& history) const {
-	std::ofstream out(SHARED_FILE, std::ios::trunc);
-	if (!out.is_open())
-		return ;
-	for (const auto &elem : history)
-		out << elem << '\n';
 
-}
 
-std::deque<std::string> ClipboardHistory::loadHistory() const {
-	std::deque<std::string> history;
-	std::ifstream in(SHARED_FILE);
 
-	if (!in.is_open())
-		return history;
 
-	std::string line;
-	while (std::getline(in,line)) {
-		if (!line.empty())
-			history.push_back(line);
-	}
-	
-	return history;
-}
